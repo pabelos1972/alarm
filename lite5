@@ -1,0 +1,554 @@
+/*********************************************************************
+ * LITE-5 – STREFA INNEN – maksymalna oszczędność energii
+ * v1.08 • 02 VI 2025
+ *
+ * Opis:
+ * Moduł LITE-5 odpowiada za zarządzanie strefą "INNEN" oraz alarmem
+ * krytycznym. Jego główne funkcjonalności to:
+ * - Retransmisja sygnału EVT_ZAPOWIEDZ_2 co 0.5s podczas odtwarzania
+ * pliku innen.wav, informując LITE-1 i LITE-3 o aktywnym ogłoszeniu.
+ * - Ignorowanie zduplikowanych sygnałów EVT_ZAPOWIEDZ_2, aby uniknąć
+ * niepotrzebnego restartowania odtwarzania innen.wav.
+ * - Zapewnienie, że LITE-1 i LITE-3 przejmą odtwarzanie zapowiedzi,
+ * jeśli LITE-5 wystartował jako pierwszy (przez retransmisję).
+ * - Obsługa komend zatrzymania/rozbrojenia z centrali (EVT_CZUWAJ,
+ * EVT_CICHO, EVT_STOP), co prowadzi do powrotu do trybu LISTEN
+ * i przejścia w deep-sleep.
+ * - Tryb deep-sleep z poborem prądu około 4 mA, identyczny jak w LITE-1.
+ *
+ * Tryby pracy:
+ * - LISTEN: Urządzenie nasłuchuje na sygnały ESP-NOW, gotowe do aktywacji.
+ * - INNEN: Aktywna zapowiedź "INNEN" (odtwarzanie innen.wav, retransmisja EVT_ZAPOWIEDZ_2,
+ * sterowanie przekaźnikiem z odpowiednimi interwałami).
+ * - CRIT: Aktywny alarm krytyczny (odtwarzanie alarm.wav,
+ * sterowanie przekaźnikiem z odpowiednimi interwałami).
+ *
+ * Zarządzanie energią:
+ * Urządzenie przechodzi w tryb deep-sleep, gdy nie jest aktywne, aby
+ * minimalizować zużycie energii. Wybudzenie następuje po przerwaniu
+ * obwodu pętli (LOOP_PIN).
+ *********************************************************************/
+
+#define THIS_IS_LITE5 // Flaga do auto-identyfikacji w common.h
+#include "common.h"   // Zawiera definicje MAC, ID urządzeń, typów zdarzeń ESP-NOW
+
+#include <M5Atom.h>
+#include <SD.h>
+#include <SPI.h>
+#include <driver/i2s.h>
+#include <esp_sleep.h>
+// WiFi.h, esp_wifi.h, esp_now.h są już załączone w common.h
+
+/* --- Konfiguracja pinów ----------------------------------------- */
+#define I2S_BCLK       22
+#define I2S_LRC        21
+#define I2S_DOUT       25
+#define I2S_NUM        I2S_NUM_0
+#define SAMPLE_RATE    44100
+#define BPS            I2S_BITS_PER_SAMPLE_16BIT
+
+#define SD_SCK         23
+#define SD_MISO        33
+#define SD_MOSI        19
+#define SD_CS          -1          // Brak HW CS w ATOM Lite - konieczne użycie SW CS, jeśli SD.begin() na to pozwala.
+
+#define RELAY_PIN      32          // Pin sterujący przekaźnikiem
+#define LOOP_PIN       39          // Pin wejściowy dla pętli (wykrywanie przerwania obwodu)
+#define AMP_EN_PIN     27          // Pin do włączania/wyłączania wzmacniacza audio
+
+/* --- Czasowe parametry działania (timeouty) --------------------- */
+#define INNEN_ON_MS      300     // Czas załączenia przekaźnika w trybie INNEN
+#define INNEN_OFF_MS     300     // Czas wyłączenia przekaźnika w trybie INNEN
+#define CRIT_ON_MS       2000    // Czas załączenia przekaźnika w trybie CRIT
+#define CRIT_OFF_MS      500     // Czas wyłączenia przekaźnika w trybie CRIT
+#define SEND_INTERVAL_MS 500     // Interwał retransmisji EVT_ZAPOWIEDZ_2
+#define AUDIO_TIMEOUT_MS 60000UL // Maksymalny czas odtwarzania audio dla INNEN przed returnToListen()
+#define CRIT_TIMEOUT_MS  600000UL // Maksymalny czas trwania alarmu CRIT
+
+/* --- Pliki WAV -------------------------------------------------- */
+// Tablica z nazwami plików WAV do odtwarzania
+const char* const wavFiles[] = { "/innen.wav", "/alarm.wav" };
+enum WavFileIndex { WAV_INNEN = 0, WAV_ALARM = 1 };
+
+/* --- Tryby pracy urządzenia ------------------------------------- */
+// Tryby pracy urządzenia, przechowywane w pamięci RTC dla zachowania stanu po deep-sleep
+enum RunMode : uint8_t { LISTEN, INNEN, CRIT };
+RTC_DATA_ATTR RunMode mode = LISTEN; // Domyślny stan po starcie/wybudzeniu
+
+/* --- Zmienne globalne stanu ------------------------------------- */
+// Timery i flagi do zarządzania logiką działania
+uint32_t tModeStart = 0;   // Czas rozpoczęcia bieżącego trybu pracy
+uint32_t tAudioEnd = 0;    // Czas zakończenia odtwarzania audio (lub timeout)
+uint32_t tNextRelay = 0;   // Czas kolejnej zmiany stanu przekaźnika
+uint32_t tNextSend = 0;    // Czas kolejnej retransmisji ESP-NOW
+uint16_t msOn = 0;         // Czas załączenia przekaźnika dla bieżącego trybu
+uint16_t msOff = 0;        // Czas wyłączenia przekaźnika dla bieżącego trybu
+
+volatile bool cancelWav = false; // Flaga do sygnalizowania zakończenia odtwarzania WAV
+bool isPlaying          = false; // Flaga wskazująca, czy plik WAV jest aktualnie odtwarzany
+TaskHandle_t wavTaskH   = nullptr; // Uchwyt do zadania FreeRTOS odpowiedzialnego za odtwarzanie WAV
+bool periphInit         = false; // Flaga wskazująca, czy peryferia audio/SD zostały zainicjalizowane
+
+/* --- Funkcje pomocnicze (helpers) ------------------------------- */
+// Krótkie, często używane funkcje inline dla lepszej czytelności i wydajności
+inline bool     loopBroken()  { return digitalRead(LOOP_PIN) == HIGH; }
+inline void     led(uint32_t c){ M5.dis.fillpix(c); }
+inline void     relay(bool on) { digitalWrite(RELAY_PIN, on ? HIGH : LOW); }
+inline void     ampEnable(bool e){ digitalWrite(AMP_EN_PIN, e ? HIGH : LOW); }
+inline uint32_t ms()           { return millis(); }
+
+/* ----------------------------------------------------------------
+ * ESP-NOW - Transmisja danych
+ * -------------------------------------------------------------- */
+// Wysyła komunikat EVT_ZAPOWIEDZ_2 do LITE-1 i LITE-3
+void sendInnenRemoteToAll() {
+  // Używamy MY_DEVICE_ID z common.h
+  struct_message m = { MY_DEVICE_ID, EVT_ZAPOWIEDZ_2, millis(), {0,0,0,0,0,0} }; // MAC opcjonalnie
+  esp_err_t result1 = esp_now_send(mac_lite1, (uint8_t*)&m, sizeof(m));
+  esp_err_t result3 = esp_now_send(mac_lite3, (uint8_t*)&m, sizeof(m));
+
+  if (result1 != ESP_OK || result3 != ESP_OK) {
+    Serial.printf("[ESP-NOW] Błąd wysyłki ZAPOWIEDZ_2: L1=%d, L3=%d\n", result1, result3);
+  } else {
+    Serial.println("[ESP-NOW] Wysłano EVT_ZAPOWIEDZ_2 do LITE-1 i LITE-3.");
+  }
+}
+
+/* ----------------------------------------------------------------
+ * WAV - Odtwarzanie w osobnym wątku (FreeRTOS Task)
+ * -------------------------------------------------------------- */
+// Zadanie FreeRTOS odpowiedzialne za dekodowanie i odtwarzanie plików WAV
+void wavTask(void* pvParameters) {
+  uint32_t notif;
+  for (;;) {
+    // Czekaj na powiadomienie o pliku do odtworzenia
+    xTaskNotifyWait(0, 0, &notif, portMAX_DELAY);
+
+    if (notif >= sizeof(wavFiles) / sizeof(wavFiles[0])) {
+      Serial.printf("[WAV] Nieprawidłowy indeks pliku: %d\n", notif);
+      continue;
+    }
+
+    File f = SD.open(wavFiles[notif]);
+    if (!f) {
+      Serial.printf("[WAV] Brak pliku: %s\n", wavFiles[notif]);
+      continue;
+    }
+
+    f.seek(44); // Pomijamy nagłówek WAV (pierwsze 44 bajty)
+    uint8_t buf[512]; // Bufor do odczytu danych audio
+    size_t bytesRead, bytesWritten;
+    isPlaying = true; // Ustaw flagę, że odtwarzanie jest aktywne
+
+    while ((bytesRead = f.read(buf, sizeof(buf))) && !cancelWav) {
+      // Zwiększenie głośności dwukrotnie
+      for (size_t i = 0; i < bytesRead; i += 2) {
+        int16_t sample = buf[i] | (buf[i + 1] << 8);
+        sample <<= 1;
+        if (sample > 32767) sample = 32767;
+        else if (sample < -32768) sample = -32768;
+        buf[i] = sample & 0xFF;
+        buf[i + 1] = (sample >> 8) & 0xFF;
+      }
+      i2s_write(I2S_NUM, buf, bytesRead, &bytesWritten, portMAX_DELAY);
+    }
+    f.close();
+    isPlaying = false; // Zakończono odtwarzanie
+    Serial.printf("[WAV] Zakończono odtwarzanie: %s\n", wavFiles[notif]);
+  }
+}
+
+/* ----------------------------------------------------------------
+ * Sterowanie audio
+ * -------------------------------------------------------------- */
+// Zatrzymuje bieżące odtwarzanie WAV i wyłącza wzmacniacz
+void stopPlayback() {
+  if (!isPlaying) return; // Nic nie jest odtwarzane
+
+  cancelWav = true;
+  // Czekaj, aż zadanie WAV zakończy bieżący cykl odtwarzania
+  while (isPlaying) {
+    vTaskDelay(1); // Pozwól innym zadaniom na działanie
+  }
+  cancelWav = false;
+  ampEnable(false); // Wyłącz wzmacniacz
+  Serial.println("[Audio] Odtwarzanie zatrzymane.");
+}
+
+// Rozpoczyna odtwarzanie pliku WAV o podanym indeksie
+void playFile(uint8_t idx) {
+  stopPlayback(); // Zawsze zatrzymaj poprzednie odtwarzanie przed nowym
+  ampEnable(true); // Włącz wzmacniacz
+
+  if (wavTaskH) {
+    xTaskNotify(wavTaskH, idx, eSetValueWithOverwrite); // Powiadom zadanie WAV o nowym pliku
+    Serial.printf("[Audio] Rozpoczęto odtwarzanie pliku: %s\n", wavFiles[idx]);
+  } else {
+    Serial.println("[Audio] Błąd: Brak uchwytu do zadania WAV.");
+  }
+}
+
+// Inicjalizuje peryferia audio (SD, I2S)
+void initAudio() {
+  if (periphInit) return; // Już zainicjalizowano
+
+  // Inicjalizacja SPI dla karty SD
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, SPI, 40000000)) { // 40MHz
+    Serial.println("[SD] Błąd inicjalizacji karty SD!");
+    led(0xFF0000); // Czerwona dioda na stałe w przypadku błędu SD
+    while (true) delay(100);
+  }
+  Serial.println("[SD] Karta SD zainicjalizowana.");
+
+  // Konfiguracja I2S
+  i2s_config_t c{};
+  c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  c.sample_rate = SAMPLE_RATE;
+  c.bits_per_sample = BPS;
+  c.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT; // Stereo
+  c.communication_format = I2S_COMM_FORMAT_I2S_MSB;
+  c.dma_buf_count = 8; // Liczba buforów DMA
+  c.dma_buf_len = 64;  // Rozmiar każdego bufora DMA (w próbkach)
+  c.use_apll = false;  // Użyj APLL (Audio PLL) dla dokładniejszych częstotliwości (domyślnie false)
+  c.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1; // Flagi alokacji przerwań
+
+  esp_err_t err = i2s_driver_install(I2S_NUM, &c, 0, nullptr);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S] Błąd instalacji sterownika I2S: %d\n", err);
+    led(0xFF0000);
+    while (true) delay(100);
+  }
+  Serial.println("[I2S] Sterownik I2S zainstalowany.");
+
+  i2s_pin_config_t p{};
+  p.bck_io_num = I2S_BCLK;
+  p.ws_io_num = I2S_LRC;
+  p.data_out_num = I2S_DOUT;
+  p.data_in_num = I2S_PIN_NO_CHANGE; // Brak wejścia I2S
+
+  err = i2s_set_pin(I2S_NUM, &p);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S] Błąd konfiguracji pinów I2S: %d\n", err);
+    led(0xFF0000);
+    while (true) delay(100);
+  }
+
+  err = i2s_set_clk(I2S_NUM, SAMPLE_RATE, BPS, I2S_CHANNEL_STEREO);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S] Błąd konfiguracji zegara I2S: %d\n", err);
+    led(0xFF0000);
+    while (true) delay(100);
+  }
+  Serial.println("[I2S] Piny I2S skonfigurowane.");
+
+  // Utwórz zadanie FreeRTOS dla odtwarzania WAV
+  xTaskCreatePinnedToCore(wavTask, "wav", 4096, nullptr, 1, &wavTaskH, 1);
+  periphInit = true;
+  Serial.println("[Audio] Peryferia audio zainicjalizowane.");
+}
+
+// Deinicjalizuje peryferia audio
+void deinitAudio() {
+  if (!periphInit) return;
+
+  stopPlayback(); // Upewnij się, że odtwarzanie jest zatrzymane
+  i2s_driver_uninstall(I2S_NUM); // Odinstaluj sterownik I2S
+  Serial.println("[I2S] Sterownik I2S odinstalowany.");
+
+  if (SD.cardType() != CARD_NONE) {
+    SD.end(); // Zakończ operacje na karcie SD
+    Serial.println("[SD] Karta SD odmontowana.");
+  }
+  periphInit = false;
+  Serial.println("[Audio] Peryferia audio zdeinicjalizowane.");
+}
+
+/* ----------------------------------------------------------------
+ * Zarządzanie energią
+ * -------------------------------------------------------------- */
+// Przełącza urządzenie w tryb Deep Sleep (głębokie uśpienie)
+void gotoDeepSleep() {
+  Serial.println("[DS] Przejście w Deep Sleep...");
+  relay(false); // Upewnij się, że przekaźnik jest wyłączony
+  led(0);       // Wyłącz diodę
+  ampEnable(false); // Wyłącz wzmacniacz
+
+  deinitAudio(); // Deinincjalizuj audio i SD przed deep sleep
+
+  // Deaktywuj ESP-NOW i Wi-Fi
+  esp_now_deinit();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  esp_wifi_stop();
+  Serial.println("[DS] Wi-Fi i ESP-NOW zdeaktywowane.");
+
+  // Zwalnianie magistrali SD-SPI i ustawienie pinów jako INPUT
+  // To pomaga zminimalizować pobór prądu
+  SPI.end(); // Kończy transakcje SPI
+  pinMode(SD_MISO, INPUT);
+  pinMode(SD_MOSI, INPUT);
+  pinMode(SD_SCK, INPUT);
+#if (SD_CS >= 0)
+  pinMode(SD_CS, INPUT);
+#endif
+  M5.dis.clear();
+  M5.dis.setBrightness(0); // Wyłącz diody M5Atom
+
+  delay(300); // Krótka zwłoka na stabilizację
+
+  // Konfiguracja wybudzania z Deep Sleep przez pin LOOP_PIN
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)LOOP_PIN, 1); // Wybudź na HIGH
+  Serial.println("[DS] Uruchamiam Deep Sleep.");
+  delay(50); // Krótka zwłoka, aby upewnić się, że Serial.flush() działa
+  Serial.flush(); // Upewnij się, że wszystkie dane szeregowe zostały wysłane
+  esp_deep_sleep_start(); // Rozpocznij Deep Sleep
+}
+
+/* ----------------------------------------------------------------
+ * Przejścia między trybami pracy
+ * -------------------------------------------------------------- */
+// Rozpoczyna tryb INNEN
+void startInnen() {
+  if (mode == INNEN) {
+    Serial.println("[MODE] Tryb INNEN już aktywny, ignoruję.");
+    return; // Zapobiega restartowaniu innen.wav i duplikacji
+  }
+  Serial.println("[MODE] Przełączam w tryb INNEN.");
+  initAudio(); // Upewnij się, że audio jest zainicjalizowane
+  mode = INNEN;
+  tModeStart = ms();
+  msOn = INNEN_ON_MS;
+  msOff = INNEN_OFF_MS;
+  tNextRelay = ms(); // Natychmiastowa zmiana stanu przekaźnika
+
+  playFile(WAV_INNEN); // Rozpocznij odtwarzanie innen.wav
+  sendInnenRemoteToAll(); // Wyślij początkową zapowiedź
+  tNextSend = ms() + SEND_INTERVAL_MS; // Ustaw timer na kolejną retransmisję
+
+  led(0xFFFF00); // Żółta dioda dla trybu INNEN
+  tAudioEnd = ms() + AUDIO_TIMEOUT_MS; // Ustaw timeout audio
+}
+
+// Rozpoczyna tryb CRIT (alarm krytyczny)
+void startCrit() {
+  if (mode == CRIT) {
+    Serial.println("[MODE] Tryb CRIT już aktywny, ignoruję.");
+    return;
+  }
+  Serial.println("[MODE] Przełączam w tryb CRIT.");
+  initAudio(); // Upewnij się, że audio jest zainicjalizowane
+  mode = CRIT;
+  tModeStart = ms();
+  tAudioEnd = ms() + CRIT_TIMEOUT_MS; // Dłuższy timeout dla alarmu krytycznego
+  msOn = CRIT_ON_MS;
+  msOff = CRIT_OFF_MS;
+  tNextRelay = ms(); // Natychmiastowa zmiana stanu przekaźnika
+
+  playFile(WAV_ALARM); // Rozpocznij odtwarzanie alarm.wav
+  led(0xFF0000); // Czerwona dioda dla trybu CRIT
+}
+
+// Wraca do trybu LISTEN i przygotowuje do Deep Sleep
+void returnToListen() {
+  if (mode == LISTEN) return; // Już w trybie LISTEN
+  Serial.println("[MODE] Powrót do trybu LISTEN.");
+  stopPlayback(); // Zakończ odtwarzanie audio
+  relay(false);   // Wyłącz przekaźnik
+  ampEnable(false); // Upewnij się, że wzmacniacz jest wyłączony (był w oryginalnym returnToListen)
+  led(0x0000FF);  // Krótka niebieska dioda sygnalizująca powrót do LISTEN
+  delay(200);
+  led(0);         // Wyłącz diodę
+  mode = LISTEN;
+}
+
+/* ----------------------------------------------------------------
+ * ESP-NOW - Funkcje pomocnicze i callback
+ * -------------------------------------------------------------- */
+// Dodaje peera ESP-NOW, jeśli jeszcze nie istnieje
+void addPeer(const uint8_t* addr) {
+  if (!esp_now_is_peer_exist(addr)) {
+    esp_now_peer_info_t p{};
+    memcpy(p.peer_addr, addr, 6);
+    p.channel = ESPNOW_CHANNEL; // Zakładam, że ESPNOW_CHANNEL jest zdefiniowany w common.h
+    p.encrypt = false; // Nie szyfrowane
+    esp_err_t result = esp_now_add_peer(&p);
+    if (result != ESP_OK) {
+      Serial.printf("[ESP-NOW] Błąd dodawania peera: %d\n", result);
+    } else {
+      Serial.printf("[ESP-NOW] Dodano peera: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+    }
+  }
+}
+
+// Callback funkcji odbierającej dane ESP-NOW
+void onDataRecv(const esp_now_recv_info_t* recv_info, const uint8_t* incomingData, int len) {
+  if (len != sizeof(struct_message)) {
+    Serial.printf("[ESP-NOW] Odebrano nieprawidłową długość wiadomości: %d bajtów.\n", len);
+    return;
+  }
+  struct_message m;
+  memcpy(&m, incomingData, sizeof(m));
+
+  Serial.printf("[ESP-NOW] Odebrano %d (typ: %d) od %d\n", m.typ_zdarzenia, m.typ_zdarzenia, m.id);
+
+  switch (m.typ_zdarzenia) {
+    case EVT_ZAPOWIEDZ_2:
+      if (mode == LISTEN) {
+        startInnen();
+      }
+      break;
+
+    case EVT_ZAPOWIEDZ_3:
+      startCrit();
+      break;
+
+    /* -- Zatrzymanie / rozbrojenie z centrali -- */
+    case EVT_CZUWAJ:
+    case EVT_CICHO:
+    case EVT_STOP: // DODANA OBSŁUGA EVT_STOP
+      Serial.println("[ESP-NOW] Odebrano komendę STOP/CZUWAJ/CICHO. Rozbrajam.");
+      returnToListen();
+      delay(100); // Krótka zwłoka na wyczyszczenie buforów
+      gotoDeepSleep(); // Przejdź w Deep Sleep
+      break;
+    
+    default:
+      Serial.printf("[ESP-NOW] Nieznany typ zdarzenia: %d\n", m.typ_zdarzenia);
+      break;
+  }
+}
+
+/* ----------------------------------------------------------------
+ * Setup / Loop
+ * -------------------------------------------------------------- */
+void setup() {
+  // Inicjalizacja M5Atom (w tym dioda)
+  M5.begin(true, false, true); // (Serial, I2C, Power)
+  Serial.begin(115200);
+  delay(100); // Krótkie opóźnienie po starcie Serial
+  Serial.println("\n--- LITE-5 v1.08 START ---");
+
+  // Konfiguracja pinów GPIO
+  pinMode(RELAY_PIN, OUTPUT);
+  relay(false); // Upewnij się, że przekaźnik jest wyłączony
+  pinMode(LOOP_PIN, INPUT_PULLUP); // Pętla jako wejście z pull-up
+  pinMode(AMP_EN_PIN, OUTPUT);
+  ampEnable(false); // Upewnij się, że wzmacniacz jest wyłączony
+
+  // Konfiguracja Wi-Fi w trybie STATION (potrzebne do ESP-NOW)
+  WiFi.mode(WIFI_STA);
+  Serial.printf("[WiFi] MAC: %s\n", WiFi.macAddress().c_str());
+
+  // Inicjalizacja ESP-NOW
+  esp_err_t esp_now_res = esp_now_init();
+  if (esp_now_res != ESP_OK) {
+    Serial.printf("[ESPNOW] Błąd inicjalizacji: %d\n", esp_now_res);
+    led(0xFF0000); // Czerwona dioda sygnalizująca błąd
+    while (true) delay(100); // Zatrzymaj program w przypadku krytycznego błędu
+  } else {
+    Serial.println("[ESPNOW] Zainicjalizowano.");
+  }
+  // Rejestracja callback funkcji odbierającej dane
+  esp_now_register_recv_cb(onDataRecv);
+
+  // Dodaj peerów (LITE-1, LITE-3, LITE-8)
+  addPeer(mac_lite1);
+  addPeer(mac_lite3);
+  addPeer(mac_lite8); // Dodany peer zgodnie z Twoim kodem
+
+  // Sprawdź przyczynę wybudzenia
+  esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+
+  if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT0) {
+    // Wybudzenie własnym drutem (LOOP_PIN)
+    Serial.println("[SETUP] Wybudzono z Deep Sleep (EXT0). Uruchamiam tryb INNEN.");
+    startInnen();
+  } else {
+    // Inny typ wybudzenia (np. reset, pierwszy start)
+    Serial.println("[SETUP] Pierwszy start lub reset. Informuję innych i przechodzę w Deep Sleep.");
+    // Zgodnie z oryginalną logiką, jeśli LITE-5 wystartował pierwszy
+    // informuje innych i sam idzie spać, zakładając, że to LITE-1/3
+    // przejmą inicjatywę lub inny zdarzenie go wybudzi.
+    sendInnenRemoteToAll(); // informujemy innych
+    gotoDeepSleep(); // przechodzimy w deep sleep
+  }
+
+  // Oryginalny kod miał tu LED, ale to było po gotoDeepSleep, co jest niespójne.
+  // Jeśli tutaj program doszedł (co znaczy, że nie poszedł spać), to ustawiamy niebieski LED.
+  // W obecnej logice powyżej, program albo idzie spać, albo wchodzi w tryb INNEN.
+  // Jeśli jest w INNEN, LED jest już żółty. Jeśli idzie spać, LED jest wyłączony.
+  // Poniższy fragment jest raczej zbędny w tej konkretnej logice.
+  // led(0x0000FF); delay(100); led(0);
+  Serial.println("--- SETUP ZAKOŃCZONY ---");
+}
+
+void loop() {
+  uint32_t now = ms();
+
+  switch (mode) {
+    case LISTEN:
+      // W trybie LISTEN, jeśli pętla jest przerwana, przejdź w tryb INNEN.
+      // Jeśli nie, kod w SETUP już zdecydował o Deep Sleep, więc tutaj nic nie robimy.
+      // Ewentualnie można dodać timeout na przejście w Deep Sleep, jeśli SETUP nie wywołał gotoDeepSleep()
+      // i chcemy, żeby LISTEN nie "czekał w nieskończoność".
+      if (loopBroken()) {
+        Serial.println("[LOOP] Pętla przerwana w trybie LISTEN. Przełączam w tryb INNEN.");
+        startInnen();
+      }
+      break;
+
+    case INNEN:
+      // Zarządzanie przekaźnikiem
+      if (now >= tNextRelay) {
+        relay(!digitalRead(RELAY_PIN)); // Zmień stan przekaźnika
+        tNextRelay = now + (digitalRead(RELAY_PIN) ? msOn : msOff);
+        Serial.printf("[INNEN] Przekaźnik %s\n", digitalRead(RELAY_PIN) ? "ON" : "OFF");
+      }
+      // Retransmisja sygnału EVT_ZAPOWIEDZ_2
+      if (now >= tNextSend) {
+        sendInnenRemoteToAll();
+        tNextSend = now + SEND_INTERVAL_MS;
+      }
+      // Ciągłe odtwarzanie innen.wav, jeśli nie gra
+      if (!isPlaying && !cancelWav) {
+        Serial.println("[INNEN] innen.wav zakończył, restartuję.");
+        playFile(WAV_INNEN); // Restartuj odtwarzanie innen.wav
+      }
+      // Timeout trybu INNEN
+      if (now - tModeStart >= AUDIO_TIMEOUT_MS) { // Użycie AUDIO_TIMEOUT_MS
+        Serial.println("[INNEN] Timeout trybu INNEN. Powrót do LISTEN.");
+        returnToListen();
+        gotoDeepSleep(); // Po powrocie do LISTEN idź spać
+      }
+      break;
+
+    case CRIT:
+      // Zarządzanie przekaźnikiem
+      if (now >= tNextRelay) {
+        relay(!digitalRead(RELAY_PIN)); // Zmień stan przekaźnika
+        tNextRelay = now + (digitalRead(RELAY_PIN) ? msOn : msOff);
+        Serial.printf("[CRIT] Przekaźnik %s\n", digitalRead(RELAY_PIN) ? "ON" : "OFF");
+      }
+      // Ciągłe odtwarzanie alarm.wav, jeśli nie gra
+      if (now < tAudioEnd && !isPlaying && !cancelWav) {
+        Serial.println("[CRIT] alarm.wav zakończył, restartuję.");
+        playFile(WAV_ALARM); // Restartuj odtwarzanie alarm.wav
+      }
+      // Timeout trybu CRIT - tylko ustaw flagę cancelWav, nie przechodzi od razu do LISTEN
+      if (now >= tAudioEnd) {
+          if (!cancelWav) { // Upewnij się, że wiadomość pojawi się tylko raz
+            Serial.println("[CRIT] Timeout trybu CRIT. Odtwarzanie audio zakończone.");
+            cancelWav = true; // Sygnalizuj zadaniu WAV, żeby się zatrzymało
+          }
+          // Możesz dodać logikę do powrotu do LISTEN/deepSleep po zakończeniu alarmu
+          // np. if (!isPlaying && digitalRead(RELAY_PIN) == LOW) returnToListen(); gotoDeepSleep();
+          // ale obecny kod pozostawia przekaźnik w rytmie i czeka na komendę rozbrojenia lub reset.
+      }
+      break;
+  }
+
+  M5.update(); // Aktualizacja stanu M5Atom (np. diody)
+  delay(10);   // Mała zwłoka, aby uniknąć zbędnego zużycia CPU
+}
