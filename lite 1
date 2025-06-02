@@ -1,0 +1,310 @@
+/*********************************************************************
+ * LITE-1 – STREFA AUSSEN – optymalny pobór prądu (audio on demand)
+ * v2.09  • 31 V 2025
+ * ▸ odbiera EVT_ZAPOWIEDZ_2 i działa jak LITE-5 (zapowiedź INNEN)
+ * ▸ jeśli AUSSEN już gra, a przychodzi INNEN_REMOTE – przerywa i przejmuje
+ * ▸ obsługuje kolejność zdarzeń: AUSSEN < INNEN < CRIT
+ * ▸ ignoruje duplikaty EVT_ZAPOWIEDZ_2 (nie restartuje innen.wav)
+ *********************************************************************/
+
+#define THIS_IS_LITE1
+#include "common.h"
+
+#include <M5Atom.h>
+#include <SD.h>
+#include <SPI.h>
+#include <driver/i2s.h>
+#include <esp_sleep.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+
+#define I2S_BCLK      22
+#define I2S_LRC       21
+#define I2S_DOUT      25
+#define I2S_NUM       I2S_NUM_0
+#define SAMPLE_RATE   44100
+#define BPS           I2S_BITS_PER_SAMPLE_16BIT
+
+#define SD_SCK        23
+#define SD_MISO       33
+#define SD_MOSI       19
+#define SD_CS         -1
+
+#define RELAY_PIN     32
+#define LOOP_PIN      39
+#define AMP_EN_PIN    27
+
+const char* const wavFiles[] = { "/aussen.wav", "/alarm.wav", "/innen.wav" };
+
+enum RunMode : uint8_t { LISTEN, AUSSEN, INNEN_REMOTE, CRIT };
+RTC_DATA_ATTR RunMode mode = LISTEN;
+
+uint32_t tModeStart = 0, tAudioEnd = 0, tNextRelay = 0;
+uint16_t msOn = 0, msOff = 0;
+
+volatile bool cancelWav = false;
+bool isPlaying = false;
+TaskHandle_t wavTaskH = nullptr;
+bool periphInit = false;
+
+/* --- helpers ---------------------------------------------------- */
+inline bool loopBroken()      { return digitalRead(LOOP_PIN) == HIGH; }
+inline void led(uint32_t rgb) { M5.dis.fillpix(rgb); }
+inline void relay(bool on)    { digitalWrite(RELAY_PIN, on ? HIGH : LOW); }
+inline void ampEnable(bool e) { digitalWrite(AMP_EN_PIN, e ? HIGH : LOW); }
+inline uint32_t ms()          { return millis(); }
+
+/* --- WAV task --------------------------------------------------- */
+void wavTask(void*) {
+  uint32_t notif;
+  for (;;) {
+    xTaskNotifyWait(0, 0, &notif, portMAX_DELAY);
+    uint8_t idx = notif;
+    if (idx > 2) continue;
+
+    File f = SD.open(wavFiles[idx]);
+    if (!f) { Serial.printf("[WAV] brak %s\n", wavFiles[idx]); continue; }
+
+    f.seek(44);                          // pomiń nagłówek WAV
+    uint8_t buf[512];
+    size_t br, bw;
+    isPlaying = true;
+    Serial.printf("[WAV_TASK] Start: %s\n", wavFiles[idx]);
+
+    while ((br = f.read(buf, sizeof(buf))) && !cancelWav) {
+      for (size_t i = 0; i < br; i += 2) {   // ×2 głośniej
+        int16_t s = buf[i] | (buf[i + 1] << 8);
+        s <<= 1;
+        if (s > 32767) s = 32767;
+        else if (s < -32768) s = -32768;
+        buf[i]   = s & 0xFF;
+        buf[i+1] = (s >> 8) & 0xFF;
+      }
+      i2s_write(I2S_NUM, buf, br, &bw, portMAX_DELAY);
+    }
+    f.close();
+    isPlaying = false;
+    Serial.printf("[WAV_TASK] Koniec: %s\n", wavFiles[idx]);
+  }
+}
+
+/* --- audio control ---------------------------------------------- */
+void stopPlayback() {
+  cancelWav = true;
+  while (isPlaying) vTaskDelay(1);
+  cancelWav = false;
+  ampEnable(false);
+}
+
+void playFile(uint8_t idx) {
+  stopPlayback();
+  ampEnable(true);
+  pinMode(AMP_EN_PIN, OUTPUT);
+  digitalWrite(AMP_EN_PIN, HIGH);
+  if (wavTaskH) xTaskNotify(wavTaskH, idx, eSetValueWithOverwrite);
+}
+
+void initAudio() {
+  if (periphInit) return;
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, SPI, 40000000)) { led(0xFF0000); while (true) delay(100); }
+
+  i2s_config_t c{};
+  c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  c.sample_rate = SAMPLE_RATE;
+  c.bits_per_sample = BPS;
+  c.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  c.communication_format = I2S_COMM_FORMAT_I2S_MSB;
+  c.dma_buf_count = 8;
+  c.dma_buf_len   = 64;
+  i2s_driver_install(I2S_NUM, &c, 0, nullptr);
+
+  i2s_pin_config_t p{};
+  p.bck_io_num = I2S_BCLK;
+  p.ws_io_num  = I2S_LRC;
+  p.data_out_num = I2S_DOUT;
+  p.data_in_num  = I2S_PIN_NO_CHANGE;
+  i2s_set_pin(I2S_NUM, &p);
+  i2s_set_clk(I2S_NUM, SAMPLE_RATE, BPS, I2S_CHANNEL_STEREO);
+
+  xTaskCreatePinnedToCore(wavTask, "wav", 4096, nullptr, 1, &wavTaskH, 1);
+  periphInit = true;
+}
+
+void deinitAudio() {
+  if (!periphInit) return;
+  stopPlayback();
+  i2s_driver_uninstall(I2S_NUM);
+  if (SD.cardType() != CARD_NONE) SD.end();
+  SPI.end();
+  periphInit = false;
+}
+
+/* --- power management ------------------------------------------- */
+void gotoDeepSleep() {
+  relay(false);
+  led(0);
+  deinitAudio();
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  esp_wifi_stop();
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)LOOP_PIN, 1);
+  Serial.println("[DS] Deep Sleep");
+  delay(100);
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+/* --- state transitions ------------------------------------------ */
+void startAussen() {
+  if (mode != LISTEN) return;
+  initAudio();
+  stopPlayback();
+  mode = AUSSEN;
+  tModeStart = ms();
+  tAudioEnd = ms() + 60000UL;
+  msOn = msOff = 500;
+  tNextRelay = ms();
+  playFile(0);                           // aussen.wav
+  led(0x00FF00);
+}
+
+void startInnenRemote() {
+  if (mode == INNEN_REMOTE || mode == CRIT) return; // ◄◄ ignore duplicates
+  stopPlayback();
+  initAudio();
+  mode = INNEN_REMOTE;
+  tModeStart = ms();
+  tAudioEnd = ms() + 60000UL;
+  msOn = msOff = 300;
+  tNextRelay = ms();
+  playFile(2);                           // innen.wav
+  led(0xFFFF00);
+}
+
+void startCrit() {
+  if (mode == CRIT) return;
+  stopPlayback();
+  initAudio();
+  mode = CRIT;
+  tModeStart = ms();
+  tAudioEnd  = ms() + 600000UL;
+  msOn = 2000; msOff = 500;
+  tNextRelay = ms();
+  playFile(1);                           // alarm.wav
+  led(0xFF0000);
+}
+
+void returnToListen() {
+  relay(false);
+  ampEnable(false);
+  led(0);
+  deinitAudio();
+  mode = LISTEN;
+  led(0x0000FF);
+  delay(200);
+  led(0);
+}
+
+/* --- ESPNOW helpers --------------------------------------------- */
+void addPeer(const uint8_t* addr) {
+  if (!esp_now_is_peer_exist(addr)) {
+    esp_now_peer_info_t p{};
+    memcpy(p.peer_addr, addr, 6);
+    p.channel = ESPNOW_CHANNEL;
+    p.encrypt = false;
+    esp_now_add_peer(&p);
+  }
+}
+
+/* --- ESPNOW RX callback ----------------------------------------- */
+void onDataRecv(const esp_now_recv_info_t*, const uint8_t* d, int l) {
+  if (l != sizeof(struct_message)) return;
+  struct_message m;
+  memcpy(&m, d, sizeof(m));
+
+  switch (m.typ_zdarzenia) {
+    case EVT_ZAPOWIEDZ_2:
+      if (mode == LISTEN || mode == AUSSEN) {
+        startInnenRemote();
+      } else {
+        Serial.println("[ESPNOW] Duplikat EVT_ZAPOWIEDZ_2 – ignoruję");
+      }
+      break;
+
+    case EVT_ZAPOWIEDZ_3:
+      startCrit();
+      break;
+
+    case EVT_CZUWAJ:
+    case EVT_CICHO:
+      returnToListen(); delay(100); gotoDeepSleep();
+      break;
+
+    default: break;
+  }
+}
+
+/* --- setup / loop ------------------------------------------------ */
+void setup() {
+  M5.begin(true, false, true);
+  Serial.begin(115200); delay(100);
+
+  pinMode(RELAY_PIN, OUTPUT); relay(false);
+  pinMode(LOOP_PIN, INPUT_PULLUP);
+  pinMode(AMP_EN_PIN, OUTPUT); ampEnable(false);
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) Serial.println("[ESPNOW] init FAIL");
+  esp_now_register_recv_cb(onDataRecv);
+
+  addPeer(mac_lite2);
+  addPeer(mac_lite5);
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
+    startAussen();
+  else
+    gotoDeepSleep();
+
+  led(0x0000FF);                        // krótkie niebieskie mignięcie
+}
+
+void loop() {
+  uint32_t now = ms();
+
+  switch (mode) {
+
+    case LISTEN:
+      if (loopBroken()) startAussen();
+      break;
+
+    case AUSSEN:
+    case INNEN_REMOTE:
+      if (now >= tNextRelay) {
+        relay(!digitalRead(RELAY_PIN));
+        tNextRelay = now + (digitalRead(RELAY_PIN) ? msOn : msOff);
+      }
+      if (!isPlaying && !cancelWav)
+        playFile(mode == AUSSEN ? 0 : 2);
+      if (now >= tAudioEnd)
+        returnToListen();
+      break;
+
+    case CRIT:
+      if (now >= tNextRelay) {
+        relay(!digitalRead(RELAY_PIN));
+        tNextRelay = now + (digitalRead(RELAY_PIN) ? msOn : msOff);
+      }
+      if (now < tAudioEnd && !isPlaying && !cancelWav)
+        playFile(1);
+      if (now >= tAudioEnd)
+        cancelWav = true;
+      break;
+  }
+
+  M5.update();
+  delay(10);
+}
