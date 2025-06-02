@@ -1,0 +1,296 @@
+/*********************************************************************
+ * LilyGO T-CALL • centrala • v2.12 • 01-06-2025
+ * ---------------------------------------------------------------
+ * ✔ JEDEN SMS na zdarzenie – blokada trzymana w NVS (FLASH)
+ * ✔ Odblokowanie tylko komendą CZUWAJ / CICHO / STOP
+ * ✔ Kompilacja czysta pod Arduino 1.8.19 + ESP32 v3.2.0
+ *********************************************************************/
+
+#define THIS_IS_LILYGO_CENTRAL
+#include "common.h"
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#define TINY_GSM_MODEM_SIM800
+#include <TinyGsmClient.h>
+#include <Preferences.h>                //  ← NEW
+
+/* ——— hardware ——— */
+#define MODEM_TX       27
+#define MODEM_RX       26
+#define MODEM_PWRKEY    4
+#define MODEM_POWER_ON 23
+#define MODEM_RST       5
+#define SerialAT       Serial1
+
+/* ——— parametry ——— */
+const char*   NUMER_WLASCICIELA = "+48501760313";
+constexpr unsigned long RETRY_MS        = 120000;
+constexpr uint8_t       SMS_RETRIES     = 3;
+constexpr uint32_t      SMS_RETRY_DELAY = 15000;
+
+/* ——— debug ——— */
+#define DEBUG_ON
+#ifdef DEBUG_ON
+  #define DBG(...)  Serial.printf(__VA_ARGS__)
+#else
+  #define DBG(...)
+#endif
+
+/* ——— globalne ——— */
+TinyGsm      modem(SerialAT);
+Preferences  prefs;                     //  ← NEW  (namespace "alarm")
+
+enum AlarmState : uint8_t { DISARMED, ARMED_NORMAL, ARMED_SILENT };
+
+RTC_DATA_ATTR AlarmState alarmState   = ARMED_NORMAL;
+RTC_DATA_ATTR char       lastZone[8]  = "";
+
+bool  alarmLock   = false;             //  stan z NVS   (true = alarm aktywny)
+bool  modemReady  = false;
+unsigned long lastGsmRetry = 0;
+
+/* FreeRTOS */
+TaskHandle_t  smsTaskH  = nullptr;
+QueueHandle_t smsQueue;
+
+/* ——— prototypy ——— */
+void addPeers();
+void startModemGSM();
+void onEspNowRx(const esp_now_recv_info_t*, const uint8_t*, int);
+void smsTask(void*);
+void checkSmsInbox();
+void sendEvtToAll(uint8_t);
+void sendEvtToAll(const struct_message&);
+void sendStatusSms();
+void saveAlarmLock(bool);              //  ← NEW
+
+/*====================================================================*/
+/*                                SETUP                               */
+/*====================================================================*/
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {}
+
+  DBG("\n=== CENTRALA LilyGO v2.12 ===\n");
+
+  /* NVS – odczyt flagi alarmu */
+  prefs.begin("alarm", false);
+  alarmLock = prefs.getBool("locked", false);
+  DBG("AlarmLock from NVS: %s\n", alarmLock ? "ON" : "OFF");
+
+  smsQueue = xQueueCreate(5, 64);
+  xTaskCreatePinnedToCore(smsTask, "smsTask", 4096, nullptr, 1, &smsTaskH, 1);
+
+  WiFi.mode(WIFI_STA);
+  ESP_ERROR_CHECK(esp_now_init());
+  addPeers();
+  esp_now_register_recv_cb(onEspNowRx);
+
+  startModemGSM();
+}
+
+/*====================================================================*/
+void loop() {
+  if (!modemReady && millis() - lastGsmRetry >= RETRY_MS) {
+    startModemGSM();
+    lastGsmRetry = millis();
+  }
+
+  static unsigned long lastPoll = 0;
+  if (millis() - lastPoll >= 3000) {
+    lastPoll = millis();
+    if (modemReady) checkSmsInbox();
+  }
+}
+
+/*====================================================================*/
+/*                           ESP-Now RX                               */
+/*====================================================================*/
+void onEspNowRx(const esp_now_recv_info_t*, const uint8_t* d, int) {
+  struct_message m; memcpy(&m, d, sizeof(m));
+
+  DBG("RX id:%02X typ:%02X info:%08lX\n",
+      m.id, m.typ_zdarzenia, (unsigned long)m.info);
+
+  bool vib        = (m.typ_zdarzenia == EVT_WSTRZAS);
+  bool critLite8  = (m.id == ID_LITE8 && m.typ_zdarzenia == EVT_ZAPOWIEDZ_3);
+  bool crit       = vib || (m.typ_zdarzenia == EVT_CRIT) || critLite8;
+
+  /* ——— pojedynczy SMS na zdarzenie ——— */
+  if (alarmState != DISARMED && crit && !alarmLock) {
+
+    /* ustalenie strefy */
+    if      (vib)              strcpy(lastZone, "VIB");
+    else if (m.id == ID_LITE2) strcpy(lastZone, "GH");
+    else if (m.id == ID_LITE5) strcpy(lastZone, "INT");
+    else                       strcpy(lastZone, "EXT");
+
+    alarmLock = true;          // blokuj kolejne
+    saveAlarmLock(true);       // zapisz w NVS
+
+    sendEvtToAll(EVT_CRIT);
+
+    if (smsTaskH) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "ALARM CRIT! Strefa: %s", lastZone);
+      xQueueSend(smsQueue, buf, 0);
+      xTaskNotifyGive(smsTaskH);
+    }
+  }
+
+  if (m.typ_zdarzenia == EVT_STATUS_REQ) {
+    struct_message r{};
+    r.id            = ID_LILYGO_CENTRAL;
+    r.typ_zdarzenia = EVT_STATUS_RESP;
+    r.info          = alarmLock ? 1 : 0;
+    memset(r.mac, 0, 6);
+    sendEvtToAll(r);
+  }
+}
+
+/*====================================================================*/
+/*                              SMS TASK                              */
+/*====================================================================*/
+void smsTask(void*) {
+  char buf[64];
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    while (xQueueReceive(smsQueue, buf, 0) == pdTRUE) {
+      for (uint8_t attempt = 1; attempt <= SMS_RETRIES; ++attempt) {
+
+        while (!modemReady) vTaskDelay(pdMS_TO_TICKS(1000));
+
+        DBG("SMS próba %u/3: \"%s\"\n", attempt, buf);
+        if (modem.sendSMS(NUMER_WLASCICIELA, buf)) {
+          DBG("SMS OK\n");
+          break;
+        }
+        DBG("SMS FAIL – retry\n");
+        vTaskDelay(pdMS_TO_TICKS(SMS_RETRY_DELAY));
+      }
+    }
+  }
+}
+
+/*====================================================================*/
+/*                        HELPER funkcje                               */
+/*====================================================================*/
+void addPeers() {
+  esp_now_peer_info_t p{}; p.channel = ESPNOW_CHANNEL; p.encrypt = false;
+  memcpy(p.peer_addr, mac_lite1, 6); esp_now_add_peer(&p);
+  memcpy(p.peer_addr, mac_lite2, 6); esp_now_add_peer(&p);
+  memcpy(p.peer_addr, mac_lite3, 6); esp_now_add_peer(&p);
+  memcpy(p.peer_addr, mac_lite5, 6); esp_now_add_peer(&p);
+  memcpy(p.peer_addr, mac_lite8, 6); esp_now_add_peer(&p);
+}
+
+inline void sendEvtToAll(uint8_t typ) {
+  struct_message m{};
+  m.id            = ID_LILYGO_CENTRAL;
+  m.typ_zdarzenia = typ;
+  sendEvtToAll(m);
+}
+inline void sendEvtToAll(const struct_message& m) {
+  esp_now_send(mac_lite1, (uint8_t*)&m, sizeof(m));
+  esp_now_send(mac_lite2, (uint8_t*)&m, sizeof(m));
+  esp_now_send(mac_lite3, (uint8_t*)&m, sizeof(m));
+  esp_now_send(mac_lite5, (uint8_t*)&m, sizeof(m));
+  esp_now_send(mac_lite8, (uint8_t*)&m, sizeof(m));
+}
+
+/*====================================================================*/
+/*                           MODEM GSM                                */
+/*====================================================================*/
+void startModemGSM() {
+  DBG("=== START MODEMU ===\n");
+
+  pinMode(MODEM_POWER_ON, OUTPUT);
+  pinMode(MODEM_PWRKEY,   OUTPUT);
+  pinMode(MODEM_RST,      OUTPUT);
+  digitalWrite(MODEM_POWER_ON, HIGH);
+  digitalWrite(MODEM_RST,      HIGH);
+  delay(100);
+  digitalWrite(MODEM_PWRKEY, LOW); delay(1200);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+
+  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(3000);
+  TinyGsmAutoBaud(SerialAT, 115200);
+
+  modemReady = modem.init()
+            && modem.waitForNetwork(30000)
+            && modem.gprsConnect("internet", "", "");
+  DBG("Modem %s\n", modemReady ? "ONLINE" : "OFFLINE");
+}
+
+/*====================================================================*/
+/*                       ODBIÓR KOMEND SMS                             */
+/*====================================================================*/
+void checkSmsInbox() {
+  SerialAT.println("AT+CMGF=1"); delay(100);
+  SerialAT.println("AT+CMGL=\"REC UNREAD\"");
+
+  unsigned long t0 = millis();
+  String line, cmd;
+  bool inBody = false;
+
+  while (millis() - t0 < 2000) {
+    if (!SerialAT.available()) { delay(10); continue; }
+    line = SerialAT.readStringUntil('\n'); line.trim();
+    if (!line.length()) continue;
+
+    if (line.startsWith("+CMGL:")) { inBody = true; cmd = ""; continue; }
+
+    if (inBody) {
+      cmd = line; cmd.toLowerCase();
+      DBG("SMS RX: \"%s\"\n", cmd.c_str());
+
+      if (cmd.indexOf("czuwaj") >= 0) {
+        alarmState = ARMED_NORMAL;
+        alarmLock  = false; saveAlarmLock(false);
+        sendEvtToAll(EVT_CZUWAJ);
+        modem.sendSMS(NUMER_WLASCICIELA,"System uzbrojony");
+      } else if (cmd.indexOf("cicho") >= 0) {
+        alarmState = ARMED_SILENT;
+        alarmLock  = false; saveAlarmLock(false);
+        sendEvtToAll(EVT_CICHO);
+        modem.sendSMS(NUMER_WLASCICIELA,"System uzbrojony (silent)");
+      } else if (cmd.indexOf("stop") >= 0) {
+        alarmState = DISARMED;
+        alarmLock  = false; saveAlarmLock(false);
+        sendEvtToAll(EVT_STOP);
+        modem.sendSMS(NUMER_WLASCICIELA,"System rozbrojony");
+      } else if (cmd == "?") {
+        sendStatusSms();
+      }
+
+      SerialAT.println("AT+CMGD=1,0");
+      inBody = false;
+    }
+  }
+}
+
+/*====================================================================*/
+/*                          SMS STATUS                                */
+/*====================================================================*/
+void sendStatusSms() {
+  char buf[96];
+  snprintf(buf, sizeof(buf),
+    "Stan: %s\nAlarm: %s\nStrefa: %s",
+    alarmState == DISARMED     ? "rozbrojony"     :
+    alarmState == ARMED_SILENT ? "uzbr. (silent)" : "uzbrojony",
+    alarmLock ? "AKTYWNY" : "BRAK",
+    alarmLock ? lastZone : "-");
+  modem.sendSMS(NUMER_WLASCICIELA, buf);
+}
+
+/*====================================================================*/
+/*                     Zapis / odczyt blokady SMS                      */
+/*====================================================================*/
+void saveAlarmLock(bool state) {
+  prefs.putBool("locked", state);
+  DBG("AlarmLock saved: %s\n", state ? "ON" : "OFF");
+}
