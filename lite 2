@@ -1,0 +1,233 @@
+/*********************************************************************
+ * LITE-2 – CZUJNIK CRIT  (SPK + RELAY)
+ * v2.00 • 1 VI 2025
+ * • blok audio-stop + deep-sleep identyczny z LITE-1 v2.09  → ~4 mA
+ *********************************************************************/
+
+#define THIS_IS_LITE2
+#include "common.h"
+
+#include <M5Atom.h>
+#include <SPI.h>
+#include <SD.h>
+#include <driver/i2s.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <esp_sleep.h>
+
+/* ── PINY ───────────────────────────────────────────────────────── */
+#define LOOP_PIN    39
+#define RELAY_PIN   32
+#define AMP_EN_PIN  27
+
+#define I2S_BCLK    22
+#define I2S_LRC     21
+#define I2S_DOUT    25
+#define I2S_NUM     I2S_NUM_0
+
+#define SD_SCK      23
+#define SD_MISO     33
+#define SD_MOSI     19
+#define SD_CS       -1
+
+/* ── AUDIO ──────────────────────────────────────────────────────── */
+static constexpr char WAV_ALARM[] = "/alarm.wav";
+
+/* ── TIMING ─────────────────────────────────────────────────────── */
+constexpr uint32_t BCAST_INTERVAL_MS = 300;      // odstęp ramek CRIT
+constexpr uint32_t BCAST_WINDOW_MS   = 5000;     // okno broadcastu
+constexpr uint32_t AUDIO_WINDOW_MS   = 600000;   // 10 min alarm.wav
+constexpr uint16_t RELAY_ON_MS       = 2000;
+constexpr uint16_t RELAY_OFF_MS      = 500;
+
+/* ── STANY ──────────────────────────────────────────────────────── */
+enum RunMode : uint8_t { SLEEPING, CRIT };
+RTC_DATA_ATTR RunMode mode = SLEEPING;
+
+uint32_t tCritStart = 0, tNextCast = 0, tAudioEnd = 0, tRelayNext = 0;
+bool      relayState = false;
+
+/* ── FLAGI ISR (ramki ESPNOW) ──────────────────────────────────── */
+volatile bool fCrit = false, fSilence = false, fReset = false;
+
+/* ── AUDIO TASK & PERIPHERALS ──────────────────────────────────── */
+volatile bool cancelWav = false, isPlaying = false;
+TaskHandle_t  wavTaskH  = nullptr;
+bool          periphInit = false;
+
+/* ── HELPERS ───────────────────────────────────────────────────── */
+inline uint32_t ms()         { return millis(); }
+inline bool     loopBroken() { return digitalRead(LOOP_PIN) == HIGH; }
+inline void     relay(bool e){ digitalWrite(RELAY_PIN, e ? HIGH : LOW); relayState = e; }
+inline void     amp(bool e)  { digitalWrite(AMP_EN_PIN,  e ? HIGH : LOW); }
+inline void     led(uint32_t rgb){ M5.dis.fillpix(rgb); }
+
+/* ── AUDIO TASK -------------------------------------------------- */
+void wavTask(void*) {
+  uint32_t p;
+  for (;;) {
+    xTaskNotifyWait(0, 0, &p, portMAX_DELAY);
+    File f = SD.open(reinterpret_cast<const char*>(p)); if (!f) continue;
+
+    f.seek(44);
+    uint8_t buf[512]; size_t br, bw;
+    isPlaying = true; amp(true); vTaskDelay(40/portTICK_PERIOD_MS);
+
+    while ((br = f.read(buf, sizeof(buf))) && !cancelWav)
+      i2s_write(I2S_NUM, buf, br, &bw, portMAX_DELAY);
+
+    f.close(); isPlaying = false; amp(false);
+  }
+}
+
+/* ── AUDIO INIT / DEINIT – 1:1 z LITE-1 ───────────────────────── */
+void initAudio() {
+  if (periphInit) return;
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, SPI, 40000000)) { periphInit = true; return; }
+
+  i2s_config_t c{};
+  c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  c.sample_rate = 44100;
+  c.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  c.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  c.communication_format = I2S_COMM_FORMAT_I2S_MSB;
+  c.dma_buf_count = 8; c.dma_buf_len = 64;
+  i2s_driver_install(I2S_NUM, &c, 0, nullptr);
+
+  i2s_pin_config_t p{};
+  p.bck_io_num = I2S_BCLK; p.ws_io_num = I2S_LRC;
+  p.data_out_num = I2S_DOUT; p.data_in_num = I2S_PIN_NO_CHANGE;
+  i2s_set_pin(I2S_NUM, &p);
+  i2s_set_clk(I2S_NUM, 44100, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+
+  xTaskCreatePinnedToCore(wavTask, "wav", 4096, nullptr, 1, &wavTaskH, 1);
+  periphInit = true;
+}
+
+void stopAlarm() {
+  cancelWav = true;
+  while (isPlaying) vTaskDelay(1);
+  cancelWav = false; amp(false);
+}
+
+void deinitAudio() {
+  if (!periphInit) return;
+  stopAlarm();
+  i2s_driver_uninstall(I2S_NUM);
+  if (SD.cardType() != CARD_NONE) SD.end();
+  SPI.end();
+  periphInit = false;
+}
+
+/* ── POWER MANAGEMENT – _dokładnie_ jak w LITE-1 ──────────────── */
+void gotoDeepSleep() {
+  relay(false);
+  led(0);
+  deinitAudio();
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  esp_wifi_stop();
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)LOOP_PIN, 1);
+
+  Serial.println("[DS] Deep Sleep");
+  delay(100); Serial.flush();
+  esp_deep_sleep_start();
+}
+
+/* ── ESPNOW ─────────────────────────────────────────────────────── */
+void addPeer(const uint8_t* mac){
+  if (!esp_now_is_peer_exist(mac)) {
+    esp_now_peer_info_t p{}; memcpy(p.peer_addr, mac, 6);
+    p.channel = ESPNOW_CHANNEL; esp_now_add_peer(&p);
+  }
+}
+void sendEvt(uint8_t ev, const uint8_t* mac){
+  struct_message m{ MY_DEVICE_ID, ev, ms() };
+  esp_now_send(mac, reinterpret_cast<uint8_t*>(&m), sizeof(m));
+}
+void sendCritFrame(){
+  sendEvt(EVT_ZAPOWIEDZ_3, mac_lite8);
+  sendEvt(EVT_ZAPOWIEDZ_3, mac_lilygo_centrala);
+}
+
+/* ── ISR (odbiór ramek) ─────────────────────────────────────────── */
+void IRAM_ATTR onRx(const esp_now_recv_info_t*, const uint8_t* d, int l){
+  if (l != sizeof(struct_message)) return;
+  struct_message m; memcpy(&m, d, sizeof(m));
+  switch (m.typ_zdarzenia) {
+    case EVT_ZAPOWIEDZ_3: fCrit    = true; break;
+    case EVT_CICHO:       fSilence = true; break;
+    case EVT_CZUWAJ:      fReset   = true; break;
+    default:;
+  }
+}
+
+/* ── START CRIT -------------------------------------------------- */
+void playAlarm(){
+  if (wavTaskH)
+    xTaskNotify(wavTaskH, reinterpret_cast<uint32_t>(WAV_ALARM),
+                eSetValueWithOverwrite);
+}
+void startCrit(){
+  mode = CRIT;
+  tCritStart = ms();
+  tNextCast  = tCritStart;
+  tAudioEnd  = tCritStart + AUDIO_WINDOW_MS;
+  tRelayNext = tCritStart;
+  relayState = false;
+
+  initAudio(); playAlarm(); sendCritFrame();
+}
+
+/* ── SETUP ─────────────────────────────────────────────────────── */
+void setup(){
+  M5.begin(true, false, true);
+  led(0);
+
+  Serial.begin(115200); delay(100);
+  pinMode(LOOP_PIN , INPUT_PULLUP);
+  pinMode(RELAY_PIN, OUTPUT); relay(false);
+  pinMode(AMP_EN_PIN, OUTPUT); amp(false);
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) Serial.println("[ESPNOW] init FAIL");
+  esp_now_register_recv_cb(onRx);
+
+  addPeer(mac_lite8); addPeer(mac_lilygo_centrala);
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 && loopBroken())
+    startCrit();
+  else
+    gotoDeepSleep();
+}
+
+/* ── LOOP ───────────────────────────────────────────────────────── */
+void loop(){
+  uint32_t now = ms();
+
+  /* flagi z ISR */
+  if (fCrit)    { fCrit    = false; if (mode != CRIT) startCrit(); }
+  if (fSilence) { fSilence = false; gotoDeepSleep();  }
+  if (fReset)   { fReset   = false; gotoDeepSleep();  }
+
+  /* hardware-loop fallback */
+  if (mode == SLEEPING && loopBroken()) startCrit();
+
+  if (mode == CRIT) {
+    if (now - tCritStart < BCAST_WINDOW_MS && now >= tNextCast) {
+      sendCritFrame(); tNextCast = now + BCAST_INTERVAL_MS;
+    }
+    if (now >= tRelayNext) {
+      relay(!relayState);
+      tRelayNext = now + (relayState ? RELAY_ON_MS : RELAY_OFF_MS);
+    }
+    if (now < tAudioEnd && !isPlaying && !cancelWav) playAlarm();
+    if (now >= tAudioEnd) gotoDeepSleep();
+  }
+
+  delay(10);
+}
