@@ -1,0 +1,218 @@
+/*********************************************************************
+ *  LITE-8 – STREFA KRYTYCZNA           v3.2   31 V 2025
+ *  • GPIO26 jako wejście pętli alarmowej
+ *  • brak Deep-Sleep (ciągłe MONITOR ≈ 50 mA)
+ *  • retransmisja EVT_ZAPOWIEDZ_3 co 1 s w trybie CRIT
+ *  • bezpieczny fallback przy braku karty SD – nadal broadcastuje
+ *********************************************************************/
+
+#define THIS_IS_LITE8
+#include "common.h"
+
+#include <M5Atom.h>
+#include <SPI.h>
+#include <SD.h>
+#include <driver/i2s.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <algorithm>
+
+/* ── PINY ────────────────────────────────── */
+#define I2S_BCLK   22
+#define I2S_LRC    21
+#define I2S_DOUT   25
+#define I2S_NUM    I2S_NUM_0
+#define SD_SCK     23
+#define SD_MISO    33
+#define SD_MOSI    19
+#define SD_CS      -1
+#define RELAY_PIN  32
+#define LOOP_PIN   26
+#define AMP_EN_PIN 27
+
+/* ── KONFIG ────────────────────── */
+#define CRIT_BCAST_MS 1000UL
+
+/* ── STANY ──────────────────────── */
+const char* const WAV_ALARM = "/alarm.wav";
+enum RunMode : uint8_t { MONITOR, CRIT };
+RunMode   mode           = MONITOR;
+uint32_t  tCritStart     = 0;
+uint32_t  tAudioEnd      = 0;
+uint32_t  tPatternSwap   = 0;
+uint32_t  tNextCast      = 0;
+
+uint32_t  msOn=0, msOff=0, tNext=0;
+bool      relayState=false, patternOn=false;
+
+/* ── AUDIO TASK ───────────────── */
+volatile bool cancelWav=false, isPlaying=false;
+TaskHandle_t  wavTaskH=nullptr;
+
+/* ── FLAGI ISR ───────────────── */
+volatile bool fCrit=false, fReset=false, fSilence=false;
+
+/* ── HELPERS ─────────────────── */
+inline uint32_t ms()            { return millis(); }
+inline bool     loopBroken()    { return digitalRead(LOOP_PIN)==HIGH; }
+inline void     led(uint32_t c) { M5.dis.fillpix(c); }
+inline void     amp(bool e)     { digitalWrite(AMP_EN_PIN,e?HIGH:LOW); }
+void relay(bool on){ digitalWrite(RELAY_PIN,on?HIGH:LOW); relayState=on; }
+
+/* ══════════ WAV TASK ══════════ */
+void wavTask(void*){
+  uint32_t n;
+  for(;;){
+    xTaskNotifyWait(0,0,&n,portMAX_DELAY);
+    const char* fn=(const char*)n;
+    File f=SD.open(fn);
+    if(!f) continue;
+
+    f.seek(44); uint8_t buf[512]; size_t br,bw;
+    isPlaying=true; amp(true); vTaskDelay(40/portTICK_PERIOD_MS);
+
+    while((br=f.read(buf,sizeof(buf))) && !cancelWav){
+      for(size_t i=0;i<br;i+=2){
+        int16_t s=buf[i]|(buf[i+1]<<8); s<<=1;
+        if(s>32767) s=32767; else if(s<-32768) s=-32768;
+        buf[i]=s; buf[i+1]=s>>8;
+      }
+      i2s_write(I2S_NUM,buf,br,&bw,portMAX_DELAY);
+    }
+    f.close(); isPlaying=false; amp(false);
+  }
+}
+inline void playWav(const char* p){
+  if (wavTaskH != nullptr) {
+    xTaskNotify(wavTaskH, (uint32_t)p, eSetValueWithOverwrite);
+  } else {
+    Serial.println("[WARN] Brak wavTaskH – tylko broadcast bez dźwięku.");
+  }
+}
+void stopPlayback(){
+  cancelWav=true; uint32_t to=ms()+800;
+  while(isPlaying && ms()<to) vTaskDelay(1);
+  cancelWav=false; amp(false);
+}
+
+/* ══════════ AUDIO INIT ══════════ */
+bool audioInit=false;
+void initAudio(){
+  if(audioInit) return;
+  SPI.begin(SD_SCK,SD_MISO,SD_MOSI,SD_CS);
+  if(!SD.begin(SD_CS,SPI,40000000)){
+    Serial.println("[ERROR] Nie mozna zainicjalizowac SD – tylko broadcast bez dźwięku");
+    led(0xFF0000);
+    wavTaskH = nullptr; // brak audio
+    audioInit = true;
+    return;
+  }
+
+  i2s_config_t c{};
+  c.mode=(i2s_mode_t)(I2S_MODE_MASTER|I2S_MODE_TX);
+  c.sample_rate=44100; c.bits_per_sample=I2S_BITS_PER_SAMPLE_16BIT;
+  c.channel_format=I2S_CHANNEL_FMT_RIGHT_LEFT;
+  c.communication_format=I2S_COMM_FORMAT_I2S_MSB;
+  c.dma_buf_count=8; c.dma_buf_len=64;
+  i2s_driver_install(I2S_NUM,&c,0,nullptr);
+
+  i2s_pin_config_t p{};
+  p.bck_io_num=I2S_BCLK; p.ws_io_num=I2S_LRC;
+  p.data_out_num=I2S_DOUT; p.data_in_num=I2S_PIN_NO_CHANGE;
+  i2s_set_pin(I2S_NUM,&p);
+  i2s_set_clk(I2S_NUM,44100,I2S_BITS_PER_SAMPLE_16BIT,I2S_CHANNEL_STEREO);
+
+  xTaskCreatePinnedToCore(wavTask,"wav",4096,nullptr,1,&wavTaskH,1);
+  audioInit=true;
+}
+
+/* ══════════ ESP-NOW ══════════ */
+void addPeer(const uint8_t* mac){
+  if(!esp_now_is_peer_exist(mac)){
+    esp_now_peer_info_t pi{}; memcpy(pi.peer_addr,mac,6);
+    pi.channel=ESPNOW_CHANNEL; esp_now_add_peer(&pi);
+  }
+}
+void sendEvt(uint8_t ev,const uint8_t* mac){
+  struct_message m{MY_DEVICE_ID,ev,ms()};
+  esp_now_send(mac,(uint8_t*)&m,sizeof(m));
+}
+void bcastCrit(){
+  sendEvt(EVT_ZAPOWIEDZ_3,mac_lilygo_centrala);
+  sendEvt(EVT_ZAPOWIEDZ_3,mac_lite1);
+  sendEvt(EVT_ZAPOWIEDZ_3,mac_lite3);
+  sendEvt(EVT_ZAPOWIEDZ_3,mac_lite5);
+}
+
+/* ══════════ STANY ══════════ */
+void startCrit(){
+  if(mode==CRIT) return;
+  initAudio();
+  mode=CRIT; tCritStart=ms();
+  tAudioEnd=tCritStart+600000UL; tPatternSwap=tAudioEnd;
+  tNextCast=ms()+CRIT_BCAST_MS;
+  msOn=2000; msOff=500; patternOn=true; tNext=ms();
+  playWav(WAV_ALARM); bcastCrit(); led(0xFF0000);
+}
+void resetMonitor(){
+  stopPlayback(); relay(false); patternOn=false;
+  mode=MONITOR; led(0x0000FF);
+}
+
+/* ══════════ ISR ══════════ */
+void IRAM_ATTR onRx(const esp_now_recv_info_t*,const uint8_t* d,int l){
+  if(l!=sizeof(struct_message)) return;
+  struct_message m; memcpy(&m,d,sizeof(m));
+  switch(m.typ_zdarzenia){
+    case EVT_ZAPOWIEDZ_3: fCrit=true;    break;
+    case EVT_CZUWAJ:      fReset=true;   break;
+    case EVT_CICHO:       fSilence=true; break;
+    default:;
+  }
+}
+
+/* ══════════ SETUP ══════════ */
+void setup(){
+  M5.begin(true,false,true);
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN,OUTPUT); relay(false);
+  pinMode(LOOP_PIN ,INPUT_PULLUP);
+  pinMode(AMP_EN_PIN,OUTPUT); amp(false);
+  M5.dis.drawpix(0,0);
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  esp_wifi_set_channel(ESPNOW_CHANNEL,WIFI_SECOND_CHAN_NONE);
+  esp_now_init(); esp_now_register_recv_cb(onRx);
+
+  addPeer(mac_lilygo_centrala);
+  addPeer(mac_lite1); addPeer(mac_lite3); addPeer(mac_lite5);
+
+  led(0x0000FF);
+}
+
+/* ══════════ LOOP ══════════ */
+void loop(){
+  uint32_t now=ms();
+
+  if(fCrit){    fCrit=false;    startCrit();  }
+  if(fReset){   fReset=false;   resetMonitor();}
+  if(fSilence){ fSilence=false; stopPlayback();}
+
+  if(mode==MONITOR && loopBroken()) startCrit();
+
+  if(patternOn && now>=tNext){
+    relay(!relayState); tNext=now+(relayState?msOn:msOff);
+  }
+
+  if(mode==CRIT){
+    if(now>=tNextCast){ bcastCrit(); tNextCast=now+CRIT_BCAST_MS; }
+    if(now<tAudioEnd && !isPlaying && !cancelWav) playWav(WAV_ALARM);
+    if(now>=tAudioEnd) stopPlayback();
+    if(now>=tPatternSwap && (msOn!=1000||msOff!=1000)) msOn=msOff=1000;
+  }
+
+  delay(10);
+}
